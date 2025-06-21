@@ -1,86 +1,54 @@
+import streamlit as st
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+from peft import PeftModel, PeftConfig
 import torch
-from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
-from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
 
-# === CONFIG ===
-MODEL_NAME = "bigcode/starcoder2-3b"  # Or deepseek-ai/deepseek-coder-1.3b-instruct
-DATA_PATH = "copilot_data.jsonl"
-MAX_LENGTH = 512
-BATCH_SIZE = 2
-EPOCHS = 3
-LEARNING_RATE = 2e-4
+# === Load fine-tuned model ===
+MODEL_PATH = "./copilot-lora-model"
 
-# === LOAD DATA ===
-def format_pair(example):
-    return {"text": f"<|user|>\n{example['prompt']}\n<|assistant|>\n{example['completion']}"}
+st.set_page_config(page_title="Mini Copilot", layout="wide")
 
-dataset = load_dataset("json", data_files=DATA_PATH)
-dataset = dataset["train"].map(format_pair)
+@st.cache_resource
+def load_model():
+    base_model = AutoModelForCausalLM.from_pretrained(
+        MODEL_PATH,
+        device_map="auto",
+        torch_dtype=torch.float16,
+        trust_remote_code=True
+    )
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
+    tokenizer.pad_token = tokenizer.eos_token
+    return base_model.eval(), tokenizer
 
-# === TOKENIZER ===
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
-tokenizer.pad_token = tokenizer.eos_token  # Avoid errors
+model, tokenizer = load_model()
 
-def tokenize(example):
-    return tokenizer(example["text"], truncation=True, padding="max_length", max_length=MAX_LENGTH)
+# === Generate response ===
+def generate_code(prompt):
+    input_text = f"<|user|>\n{prompt}\n<|assistant|>\n"
+    inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=150,
+            temperature=0.7,
+            top_p=0.9,
+            do_sample=True,
+            pad_token_id=tokenizer.eos_token_id
+        )
+    decoded = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return decoded.split("<|assistant|>")[-1].strip()
 
-tokenized_dataset = dataset.map(tokenize, remove_columns=dataset.column_names)
+# === Streamlit UI ===
+st.title("🧠 Mini Copilot: AI Code Assistant")
+st.markdown("Built with StarCoder + LoRA")
 
-# === LOAD MODEL WITH 4-BIT QUANTIZATION ===
-from transformers import BitsAndBytesConfig
+code_prompt = st.text_area("💬 Enter your prompt", placeholder="e.g., Write a Python class for a calculator...")
 
-bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_use_double_quant=True,
-                                bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
+if st.button("🚀 Generate Code"):
+    if code_prompt.strip() == "":
+        st.warning("Please enter a prompt.")
+    else:
+        with st.spinner("Thinking like Copilot..."):
+            result = generate_code(code_prompt)
+            st.code(result, language="python")
 
-base_model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    device_map="auto",
-    quantization_config=bnb_config,
-    trust_remote_code=True
-)
-
-# === PREPARE FOR PEFT/LoRA ===
-base_model = prepare_model_for_kbit_training(base_model)
-
-lora_config = LoraConfig(
-    r=16,
-    lora_alpha=32,
-    target_modules=["q_proj", "v_proj"],  # for StarCoder
-    lora_dropout=0.05,
-    bias="none",
-    task_type=TaskType.CAUSAL_LM
-)
-
-model = get_peft_model(base_model, lora_config)
-model.print_trainable_parameters()
-
-# === TRAINING SETUP ===
-training_args = TrainingArguments(
-    output_dir="./copilot-lora-model",
-    per_device_train_batch_size=BATCH_SIZE,
-    gradient_accumulation_steps=4,
-    learning_rate=LEARNING_RATE,
-    num_train_epochs=EPOCHS,
-    logging_steps=10,
-    save_strategy="epoch",
-    evaluation_strategy="no",
-    fp16=True,
-    report_to="none"
-)
-
-# === DATALOADER ===
-data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-
-# === TRAIN ===
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=tokenized_dataset,
-    tokenizer=tokenizer,
-    data_collator=data_collator
-)
-
-trainer.train()
-trainer.save_model()
-tokenizer.save_pretrained("./copilot-lora-model")
