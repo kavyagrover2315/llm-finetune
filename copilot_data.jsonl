@@ -1,0 +1,2 @@
+{"prompt": "Write a Python function to reverse a string.", "completion": "def reverse_string(s):\n    return s[::-1]"}
+{"prompt": "Create a class for a bank account.", "completion": "class BankAccount:\n    def __init__(self):\n        self.balance = 0"}
