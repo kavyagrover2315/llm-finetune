@@ -1,0 +1,86 @@
+import torch
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments, Trainer, DataCollatorForLanguageModeling
+from peft import get_peft_model, LoraConfig, TaskType, prepare_model_for_kbit_training
+
+# === CONFIG ===
+MODEL_NAME = "bigcode/starcoder2-3b"  # Or deepseek-ai/deepseek-coder-1.3b-instruct
+DATA_PATH = "copilot_data.jsonl"
+MAX_LENGTH = 512
+BATCH_SIZE = 2
+EPOCHS = 3
+LEARNING_RATE = 2e-4
+
+# === LOAD DATA ===
+def format_pair(example):
+    return {"text": f"<|user|>\n{example['prompt']}\n<|assistant|>\n{example['completion']}"}
+
+dataset = load_dataset("json", data_files=DATA_PATH)
+dataset = dataset["train"].map(format_pair)
+
+# === TOKENIZER ===
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, use_fast=True)
+tokenizer.pad_token = tokenizer.eos_token  # Avoid errors
+
+def tokenize(example):
+    return tokenizer(example["text"], truncation=True, padding="max_length", max_length=MAX_LENGTH)
+
+tokenized_dataset = dataset.map(tokenize, remove_columns=dataset.column_names)
+
+# === LOAD MODEL WITH 4-BIT QUANTIZATION ===
+from transformers import BitsAndBytesConfig
+
+bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_use_double_quant=True,
+                                bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.float16)
+
+base_model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME,
+    device_map="auto",
+    quantization_config=bnb_config,
+    trust_remote_code=True
+)
+
+# === PREPARE FOR PEFT/LoRA ===
+base_model = prepare_model_for_kbit_training(base_model)
+
+lora_config = LoraConfig(
+    r=16,
+    lora_alpha=32,
+    target_modules=["q_proj", "v_proj"],  # for StarCoder
+    lora_dropout=0.05,
+    bias="none",
+    task_type=TaskType.CAUSAL_LM
+)
+
+model = get_peft_model(base_model, lora_config)
+model.print_trainable_parameters()
+
+# === TRAINING SETUP ===
+training_args = TrainingArguments(
+    output_dir="./copilot-lora-model",
+    per_device_train_batch_size=BATCH_SIZE,
+    gradient_accumulation_steps=4,
+    learning_rate=LEARNING_RATE,
+    num_train_epochs=EPOCHS,
+    logging_steps=10,
+    save_strategy="epoch",
+    evaluation_strategy="no",
+    fp16=True,
+    report_to="none"
+)
+
+# === DATALOADER ===
+data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+
+# === TRAIN ===
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_dataset,
+    tokenizer=tokenizer,
+    data_collator=data_collator
+)
+
+trainer.train()
+trainer.save_model()
+tokenizer.save_pretrained("./copilot-lora-model")
